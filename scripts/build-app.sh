@@ -5,9 +5,12 @@ cd "$(dirname "$0")/.."
 
 APP=build/LanChat.app
 VERSION=${VERSION:-1.0.0}
+# UNIVERSAL=1 时同时编译 Apple Silicon 和 Intel（发布用）
+ARCH_FLAGS=()
+[[ "${UNIVERSAL:-0}" == 1 ]] && ARCH_FLAGS=(--arch arm64 --arch x86_64)
 
-swift build -c release
-BIN=$(swift build -c release --show-bin-path)/LanChat
+swift build -c release "${ARCH_FLAGS[@]}"
+BIN=$(swift build -c release "${ARCH_FLAGS[@]}" --show-bin-path)/LanChat
 
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
@@ -44,4 +47,12 @@ cat > "$APP/Contents/Info.plist" <<EOF
 EOF
 
 codesign --force --deep --sign - "$APP"
-echo "✅ 已生成 $APP"
+echo "✅ 已生成 $APP（$(lipo -archs "$APP/Contents/MacOS/LanChat")）"
+
+# ZIP=1 时额外打包 build/LanChat-<版本>.zip（ditto 保留签名和扩展属性）
+if [[ "${ZIP:-0}" == 1 ]]; then
+  ZIPFILE="build/LanChat-${VERSION}.zip"
+  rm -f "$ZIPFILE"
+  ditto -c -k --keepParent "$APP" "$ZIPFILE"
+  echo "✅ 已打包 $ZIPFILE"
+fi

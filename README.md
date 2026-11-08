@@ -38,6 +38,17 @@ open -n -W build/LanChat.app --env LANCHAT_DIAG=1 --stdout /dev/stdout   # 输�
 open -n build/LanChat.app --env LANCHAT_PROFILE=B   # 在同一台机器上开第二个实例做测试
 ```
 
+## 自动构建与发布
+
+GitHub Actions（`.github/workflows/build.yml`）在 macOS 云端构建：
+
+- **推送到 main 或提交 PR**：跑测试并构建 Universal 版（Apple Silicon + Intel），zip 包在该次 Actions 运行页面的 Artifacts 里下载（保留 14 天）
+- **发布正式版本**：任选一种方式，会创建 GitHub Release 并附上 `LanChat-<版本>.zip`
+  - 打标签推送：`git tag v1.2.0 && git push origin v1.2.0`
+  - 网页上：Actions → Build → Run workflow，填写版本号 `1.2.0`
+
+本地也可以打同样的包：`VERSION=1.2.0 UNIVERSAL=1 ZIP=1 ./scripts/build-app.sh`
+
 ## 数据位置
 
 | 内容 | 路径 |

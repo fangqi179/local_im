@@ -1,0 +1,81 @@
+# 构建与发布
+# - 推送到 main / 提交 PR：跑测试，构建 Universal 版 LanChat.app，作为 Actions 构建产物上传（保留 14 天）
+# - 推送 v* 标签（如 v1.2.0），或在 Actions 页面手动运行并填写版本号：额外创建 GitHub Release 并附上 zip
+name: Build
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+    paths-ignore: ["**.md", "LICENSE"]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "发布的版本号，如 1.2.0（会创建 v1.2.0 标签和 Release）"
+        required: true
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  build:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 确定版本号
+        id: ver
+        run: |
+          if [[ "${{ github.event_name }}" == workflow_dispatch ]]; then
+            V="${{ inputs.version }}"; V="${V#v}"; RELEASE=1
+          elif [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            V="${GITHUB_REF#refs/tags/v}"; RELEASE=1
+          else
+            V="0.0.0-dev.${GITHUB_RUN_NUMBER}"; RELEASE=0
+          fi
+          [[ "$V" =~ ^[0-9]+\.[0-9]+\.[0-9]+ ]] || { echo "::error::版本号格式应为 x.y.z，实际为 $V"; exit 1; }
+          echo "version=$V" >> "$GITHUB_OUTPUT"
+          echo "release=$RELEASE" >> "$GITHUB_OUTPUT"
+          echo "版本 $V，发布：$RELEASE"
+          swift --version
+
+      - name: 测试
+        run: swift test
+
+      - name: 构建 LanChat.app
+        env:
+          VERSION: ${{ steps.ver.outputs.version }}
+          UNIVERSAL: "1"
+          ZIP: "1"
+        run: ./scripts/build-app.sh
+
+      - name: 上传构建产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: LanChat-${{ steps.ver.outputs.version }}
+          path: build/LanChat-*.zip
+          retention-days: 14
+
+      - name: 发布 Release
+        if: steps.ver.outputs.release == '1'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          V: ${{ steps.ver.outputs.version }}
+        run: |
+          cat > notes.md <<'EOF'
+          ## 安装
+
+          1. 下载下方的 `LanChat-*.zip`，解压后把 `LanChat.app` 拖到「应用程序」文件夹
+          2. 本 App 未经 Apple 公证，首次打开会被拦截：在「系统设置 → 隐私与安全性」底部点**仍要打开**；
+             或在终端执行 `xattr -dr com.apple.quarantine /Applications/LanChat.app` 后再打开
+          3. 系统询问"是否允许查找本地网络上的设备"时点**允许**
+
+          支持 macOS 14 及以上，Apple Silicon 与 Intel 通用。
+          EOF
+          gh release create "v$V" build/LanChat-"$V".zip \
+            --title "LanChat $V" --notes-file notes.md --generate-notes --target "$GITHUB_SHA"
