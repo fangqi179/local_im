@@ -1,6 +1,16 @@
 # LanChat
 
+[![最新版本](https://img.shields.io/github/v/release/fangqi179/local_im?label=%E6%9C%80%E6%96%B0%E7%89%88%E6%9C%AC)](https://github.com/fangqi179/local_im/releases/latest)
+[![构建](https://github.com/fangqi179/local_im/actions/workflows/build.yml/badge.svg)](https://github.com/fangqi179/local_im/actions/workflows/build.yml)
+
 纯内网的极简 macOS 原生 IM：只做**发现、对话、传文件**三件事。没有服务器、没有账号，所有记录只保存在本机。
+
+## 下载
+
+- **[⬇️ 下载最新版 LanChat.zip](https://github.com/fangqi179/local_im/releases/latest/download/LanChat.zip)**（macOS 14+，Apple Silicon 与 Intel 通用）
+- [所有版本与更新记录](https://github.com/fangqi179/local_im/releases)
+
+解压后把 `LanChat.app` 拖到「应用程序」。App 未经 Apple 公证，首次打开会被拦截：到「系统设置 → 隐私与安全性」底部点**仍要打开**，或执行 `xattr -dr com.apple.quarantine /Applications/LanChat.app`。系统询问是否允许查找本地网络上的设备时点**允许**。
 
 ## 功能
 
@@ -40,12 +50,15 @@ open -n build/LanChat.app --env LANCHAT_PROFILE=B   # 在同一台机器上开�
 
 ## 自动构建与发布
 
-GitHub Actions（`.github/workflows/build.yml`）在 macOS 云端构建：
+GitHub Actions（`.github/workflows/build.yml`）在 macOS 云端完成测试、构建 Universal 版（Apple Silicon + Intel）并发布：
 
-- **推送到 main 或提交 PR**：跑测试并构建 Universal 版（Apple Silicon + Intel），zip 包在该次 Actions 运行页面的 Artifacts 里下载（保留 14 天）
-- **发布正式版本**：任选一种方式，会创建 GitHub Release 并附上 `LanChat-<版本>.zip`
-  - 打标签推送：`git tag v1.2.0 && git push origin v1.2.0`
-  - 网页上：Actions → Build → Run workflow，填写版本号 `1.2.0`
+- **推送到 main 自动发布**：每次推送都会跑测试、构建，并发布新的 Release，版本号在上一个版本上把补丁号加 1（v1.0.1 → v1.0.2）。测试失败则不发布
+  - 只改 `.md` 文件或 LICENSE 时不触发
+  - 提交说明里带 `[skip release]` 时只构建、不发布
+- **升级主/次版本号**：给提交打标签后和 main 一起推送，如 `git tag v1.1.0 && git push origin main v1.1.0`；之后的推送从 v1.1.1 继续递增。也可以在网页 Actions → Build → Run workflow 里填写版本号
+- **PR**：只跑测试和构建，zip 在该次运行页面的 Artifacts 里下载
+
+Release 附件固定命名为 `LanChat.zip`，所以上面"下载最新版"的链接始终指向最新版本。
 
 本地也可以打同样的包：`VERSION=1.2.0 UNIVERSAL=1 ZIP=1 ./scripts/build-app.sh`
 

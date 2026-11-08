@@ -1,6 +1,10 @@
 # 构建与发布
-# - 推送到 main / 提交 PR：跑测试，构建 Universal 版 LanChat.app，作为 Actions 构建产物上传（保留 14 天）
-# - 推送 v* 标签（如 v1.2.0），或在 Actions 页面手动运行并填写版本号：额外创建 GitHub Release 并附上 zip
+# - 推送到 main：跑测试、构建 Universal 版 LanChat.app，并自动发布 Release，
+#   版本号在最新的 v* 标签上把补丁号加 1（v1.0.0 → v1.0.1）。
+#   提交说明里带 [skip release] 时只构建、不发布；只改 .md / LICENSE 时不触发。
+# - 推送 v* 标签（如 v1.2.0），或在 Actions 页面手动运行并填写版本号：按指定版本发布，
+#   用于升级主/次版本号。之后推送 main 会从这个版本继续递增。
+# - 提交 PR：只跑测试和构建，产物作为 Actions 构建产物上传（保留 14 天）
 name: Build
 
 on:
@@ -18,8 +22,9 @@ on:
 permissions:
   contents: write
 
+# 发布串行执行，避免两次推送算出同一个版本号
 concurrency:
-  group: build-${{ github.ref }}
+  group: ${{ github.event_name == 'pull_request' && format('pr-{0}', github.ref) || 'release' }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
@@ -27,14 +32,32 @@ jobs:
     runs-on: macos-15
     steps:
       - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0   # 需要全部标签来计算下一个版本号
 
       - name: 确定版本号
         id: ver
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+          COMMIT_MSG: ${{ github.event.head_commit.message }}
         run: |
-          if [[ "${{ github.event_name }}" == workflow_dispatch ]]; then
-            V="${{ inputs.version }}"; V="${V#v}"; RELEASE=1
+          git fetch --tags --force -q
+          latest=$(git tag -l 'v[0-9]*.[0-9]*.[0-9]*' --sort=-v:refname | head -1)
+          if [[ "$GITHUB_EVENT_NAME" == workflow_dispatch ]]; then
+            V="${INPUT_VERSION#v}"; RELEASE=1
           elif [[ "$GITHUB_REF" == refs/tags/v* ]]; then
             V="${GITHUB_REF#refs/tags/v}"; RELEASE=1
+          elif [[ "$GITHUB_EVENT_NAME" == push && "$GITHUB_REF" == refs/heads/main ]]; then
+            if [[ "$COMMIT_MSG" == *"[skip release]"* ]]; then
+              V="0.0.0-dev.${GITHUB_RUN_NUMBER}"; RELEASE=0
+            elif git tag --points-at HEAD | grep -q '^v'; then
+              # 这个提交已经打了版本标签（随标签一起推送），由标签那次运行发布
+              V="${latest#v}"; RELEASE=0
+            else
+              IFS=. read -r MA MI PA <<< "${latest:-v1.0.0}"; MA="${MA#v}"; PA="${PA%%[^0-9]*}"
+              [[ -z "$latest" ]] && V="1.0.0" || V="$MA.$MI.$((PA + 1))"
+              RELEASE=1
+            fi
           else
             V="0.0.0-dev.${GITHUB_RUN_NUMBER}"; RELEASE=0
           fi
@@ -70,12 +93,14 @@ jobs:
           cat > notes.md <<'EOF'
           ## 安装
 
-          1. 下载下方的 `LanChat-*.zip`，解压后把 `LanChat.app` 拖到「应用程序」文件夹
+          1. 下载下方的 `LanChat.zip`，解压后把 `LanChat.app` 拖到「应用程序」文件夹
           2. 本 App 未经 Apple 公证，首次打开会被拦截：在「系统设置 → 隐私与安全性」底部点**仍要打开**；
              或在终端执行 `xattr -dr com.apple.quarantine /Applications/LanChat.app` 后再打开
           3. 系统询问"是否允许查找本地网络上的设备"时点**允许**
 
           支持 macOS 14 及以上，Apple Silicon 与 Intel 通用。
           EOF
-          gh release create "v$V" build/LanChat-"$V".zip \
+          # 附件固定命名为 LanChat.zip，README 里的"下载最新版"链接才能长期有效
+          cp build/LanChat-"$V".zip build/LanChat.zip
+          gh release create "v$V" build/LanChat.zip \
             --title "LanChat $V" --notes-file notes.md --generate-notes --target "$GITHUB_SHA"
