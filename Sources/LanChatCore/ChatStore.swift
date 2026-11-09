@@ -64,6 +64,12 @@ public struct StoredPeer: Equatable, Sendable {
     public var arpMAC: String = ""
     /// 最近一次握手时间
     public var infoAt: Date?
+    /// 已信任的对方身份公钥（尚未完成过加密握手时为 nil）
+    public var publicKey: Data?
+    /// 用户已与对方核对过安全码
+    public var keyVerified = false
+    /// 对方出示了与已信任公钥不同的新公钥，等待用户确认
+    public var pendingKey: Data?
 }
 
 public enum StoreError: Error, CustomStringConvertible {
@@ -115,6 +121,9 @@ public final class ChatStore {
             ("info_json", "TEXT NOT NULL DEFAULT ''"),
             ("arp_mac", "TEXT NOT NULL DEFAULT ''"),
             ("info_at", "REAL NOT NULL DEFAULT 0"),
+            ("public_key", "TEXT NOT NULL DEFAULT ''"),
+            ("key_verified", "INTEGER NOT NULL DEFAULT 0"),
+            ("pending_key", "TEXT NOT NULL DEFAULT ''"),
         ]
         for (name, def) in added where !cols.contains(name) {
             try exec("ALTER TABLE peers ADD COLUMN \(name) \(def)")
@@ -149,8 +158,36 @@ public final class ChatStore {
             """, [json, arpMAC, at.timeIntervalSince1970, id])
     }
 
+    /// 信任对方公钥（首次见到，或用户确认了新公钥）：清除待确认的公钥和核对状态。联系人不存在时新建。
+    public func pinPeerKey(id: String, name: String, key: Data, at: Date = Date()) {
+        let t = at.timeIntervalSince1970
+        run("""
+            INSERT INTO peers(id, name, last_seen, first_seen, public_key) VALUES(?, ?, ?, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET public_key = excluded.public_key, pending_key = '', key_verified = 0
+            """, [id, name, t, t, key.base64EncodedString()])
+    }
+
+    /// 记录对方出示的、与已信任公钥不同的新公钥。
+    public func setPendingKey(id: String, key: Data) {
+        run("UPDATE peers SET pending_key = ? WHERE id = ?", [key.base64EncodedString(), id])
+    }
+
+    public func setKeyVerified(id: String, _ verified: Bool) {
+        run("UPDATE peers SET key_verified = ? WHERE id = ?", [verified, id])
+    }
+
+    /// 全部已信任的公钥，启动时交给 ChatNode。
+    public func pinnedKeys() -> [String: Data] {
+        var out: [String: Data] = [:]
+        for p in peers() { if let k = p.publicKey { out[p.id] = k } }
+        return out
+    }
+
     public func peers() -> [StoredPeer] {
-        query("SELECT id, name, host, ip, last_seen, first_seen, info_json, arp_mac, info_at FROM peers", []) { s in
+        query("""
+            SELECT id, name, host, ip, last_seen, first_seen, info_json, arp_mac, info_at,
+                   public_key, key_verified, pending_key FROM peers
+            """, []) { s in
             var p = StoredPeer(id: s.string(0) ?? "", name: s.string(1) ?? "", host: s.string(2) ?? "",
                                ip: s.string(3) ?? "", lastSeen: Date(timeIntervalSince1970: s.double(4)))
             p.firstSeen = Date(timeIntervalSince1970: s.double(5))
@@ -160,6 +197,9 @@ public final class ChatStore {
             p.arpMAC = s.string(7) ?? ""
             let at = s.double(8)
             p.infoAt = at > 0 ? Date(timeIntervalSince1970: at) : nil
+            p.publicKey = s.string(9).flatMap { Data(base64Encoded: $0) }.flatMap { $0.isEmpty ? nil : $0 }
+            p.keyVerified = s.int64(10) != 0
+            p.pendingKey = s.string(11).flatMap { Data(base64Encoded: $0) }.flatMap { $0.isEmpty ? nil : $0 }
             return p
         }
     }

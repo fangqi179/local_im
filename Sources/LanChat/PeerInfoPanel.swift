@@ -8,9 +8,15 @@ struct VerdictIcon: View {
 
     var body: some View {
         switch verdict {
+        case .keyChanged:
+            Image(systemName: "xmark.shield.fill").foregroundStyle(.red)
+                .font(.caption).help("对方的加密密钥已变更，通信已暂停，查看设备信息确认")
         case .verified:
             Image(systemName: "checkmark.shield.fill").foregroundStyle(.green)
-                .font(.caption).help("身份已校验：ARP 实测 MAC 与对方自报一致")
+                .font(.caption).help("已与对方核对安全码，端到端加密")
+        case .matched:
+            Image(systemName: "checkmark.shield").foregroundStyle(.secondary)
+                .font(.caption).help("端到端加密，MAC 与对方自报一致；尚未核对安全码")
         case .warning:
             Image(systemName: "exclamationmark.shield.fill").foregroundStyle(.orange)
                 .font(.caption).help("身份校验有不一致项，查看设备信息了解详情")
@@ -29,6 +35,7 @@ struct PeerInfoPanel: View {
         if let d = model.detail(for: peerId) {
             Form {
                 header(d)
+                encryptionSection(d)
                 Section("身份校验") {
                     ForEach(d.checks) { check in
                         HStack(alignment: .firstTextBaseline, spacing: 8) {
@@ -88,6 +95,46 @@ struct PeerInfoPanel: View {
             if d.info == nil {
                 Text(d.online ? "对方未返回设备信息，可能是旧版本 LanChat。" : "对方离线，显示的是上次记录。")
                     .font(.caption).foregroundStyle(.secondary)
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func encryptionSection(_ d: PeerDetail) -> some View {
+        Section("端到端加密") {
+            if let pending = d.pendingKey {
+                Label("对方的加密密钥已变更，通信已暂停", systemImage: "xmark.shield.fill")
+                    .foregroundStyle(.red).font(.callout.weight(.medium))
+                Text("可能是对方重装了 LanChat 或更换了电脑，也可能有人在冒充。请当面或电话让对方打开本机的设备信息面板，核对下面的新安全码一致后再信任。")
+                    .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                row("原指纹", d.publicKey.map(E2E.fingerprint))
+                row("新指纹", E2E.fingerprint(pending))
+                row("新安全码", E2E.safetyCode(pending, d.myPublicKey).groupedInTwoLines)
+                Button("信任新密钥", role: .destructive) { model.trustNewKey(d.id) }
+            } else if d.outdated {
+                Label("对方版本过旧，不支持端到端加密", systemImage: "exclamationmark.shield.fill")
+                    .foregroundStyle(.orange)
+                Text("本机只进行加密通信，请对方升级 LanChat 后再收发消息。")
+                    .font(.caption).foregroundStyle(.secondary)
+            } else if let key = d.publicKey, let code = d.safetyCode {
+                row("安全码", code.groupedInTwoLines)
+                Text("与对方当面或电话核对：两台设备上显示的安全码完全一致，即可确认通信没有被中间人窃听。")
+                    .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                if d.keyVerified {
+                    HStack {
+                        Label("已核对", systemImage: "checkmark.shield.fill").foregroundStyle(.green)
+                        Spacer()
+                        Button("取消标记") { model.setKeyVerified(d.id, false) }.buttonStyle(.borderless)
+                    }
+                } else {
+                    Button("已核对一致，标记为已验证") { model.setKeyVerified(d.id, true) }
+                }
+                row("对方指纹", E2E.fingerprint(key))
+                row("本机指纹", E2E.fingerprint(d.myPublicKey))
+            } else {
+                Text("尚未与对方建立过加密连接。对方上线后会自动握手并记录其公钥。")
+                    .font(.caption).foregroundStyle(.secondary)
+                row("本机指纹", E2E.fingerprint(d.myPublicKey))
             }
         }
     }
@@ -167,6 +214,9 @@ struct PeerInfoPanel: View {
 
     private func copyAll(_ d: PeerDetail) {
         var lines = ["# \(d.name)（\(d.id)）"]
+        if let code = d.safetyCode {
+            lines.append("安全码：\(code)\(d.keyVerified ? "（已核对）" : "")  对方指纹：\(d.publicKey.map(E2E.fingerprint) ?? "-")  本机指纹：\(E2E.fingerprint(d.myPublicKey))")
+        }
         lines += d.checks.map { "[\($0.state == .pass ? "✓" : $0.state == .warn ? "!" : "?")] \($0.title)：\($0.detail)" }
         if let o = d.observation {
             lines.append("实测：\(o.ip ?? "-"):\(o.port.map(String.init) ?? "-") ARP=\(o.arpMAC ?? "-") 经由 \(o.localInterface ?? "-") \(o.localIP ?? "") RTT=\(o.rttMs.map { String(format: "%.1fms", $0) } ?? "-")")
@@ -183,5 +233,15 @@ struct PeerInfoPanel: View {
         lines.append("首次发现：\(d.firstSeen.map(fmt) ?? "-")  最近在线：\(d.lastSeen.map(fmt) ?? "-")")
         NSPasteboard.general.clearContents()
         NSPasteboard.general.setString(lines.joined(separator: "\n"), forType: .string)
+    }
+}
+
+private extension String {
+    /// "11111 22222 33333 44444 55555 …" → 每行 4 组
+    var groupedInTwoLines: String {
+        let groups = split(separator: " ")
+        return stride(from: 0, to: groups.count, by: 4)
+            .map { groups[$0..<min($0 + 4, groups.count)].joined(separator: " ") }
+            .joined(separator: "\n")
     }
 }

@@ -193,6 +193,16 @@ struct ChatView: View {
                 .onChange(of: model.messages.last?.id) { scrollToBottom(proxy, animated: true) }
             }
             Divider()
+            if let reason = peer.blocked {
+                HStack(alignment: .firstTextBaseline, spacing: 8) {
+                    Image(systemName: "lock.trianglebadge.exclamationmark").foregroundStyle(.red)
+                    Text(reason).font(.callout).fixedSize(horizontal: false, vertical: true)
+                    Spacer()
+                    Button("查看设备信息") { model.showInspector = true }
+                }
+                .padding(10)
+                .background(Color.red.opacity(0.08))
+            }
             inputBar
         }
         .navigationTitle(peer.name)
@@ -211,6 +221,7 @@ struct ChatView: View {
         }
         .onDrop(of: [.fileURL], isTargeted: $dropTargeted) { providers in
             guard peer.online else { model.alertMessage = "对方当前离线，无法发送文件。"; return false }
+            if let reason = peer.blocked { model.alertMessage = reason; return false }
             for p in providers {
                 _ = p.loadObject(ofClass: URL.self) { url, _ in
                     guard let url else { return }
@@ -241,14 +252,15 @@ struct ChatView: View {
             }
             .buttonStyle(.borderless)
             .help("发送文件（也可以直接把文件拖进窗口）")
-            .disabled(!peer.online)
+            .disabled(!peer.canSend)
 
-            TextField(peer.online ? "输入消息，回车发送，⌥回车换行" : "对方离线，暂时无法发送",
+            TextField(!peer.online ? "对方离线，暂时无法发送"
+                        : peer.blocked != nil ? "暂时无法发送（见上方提示）" : "输入消息，回车发送，⌥回车换行",
                       text: $draft, axis: .vertical)
                 .textFieldStyle(.plain)
                 .lineLimit(1...6)
                 .focused($inputFocused)
-                .disabled(!peer.online)
+                .disabled(!peer.canSend)
                 .onSubmit(send)
                 .padding(.vertical, 6).padding(.horizontal, 10)
                 .background(RoundedRectangle(cornerRadius: 8).fill(Color(nsColor: .textBackgroundColor)))
@@ -256,13 +268,13 @@ struct ChatView: View {
 
             Button("发送", action: send)
                 .keyboardShortcut(.return, modifiers: .command)
-                .disabled(!peer.online || draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                .disabled(!peer.canSend || draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
         }
         .padding(10)
     }
 
     private func send() {
-        guard peer.online else { return }
+        guard peer.canSend else { return }
         model.sendText(draft)
         draft = ""
         inputFocused = true

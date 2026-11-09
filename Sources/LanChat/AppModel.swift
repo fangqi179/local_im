@@ -1,4 +1,5 @@
 import AppKit
+import CryptoKit
 import Foundation
 import LanChatCore
 import SystemConfiguration
@@ -12,8 +13,12 @@ struct PeerRow: Identifiable, Equatable {
     let mac: String
     let verdict: IdentityVerdict
     let online: Bool
+    /// 不能通信的原因（加密密钥变更待确认、对方版本过旧）
+    let blocked: String?
     let lastMessage: ChatMessage?
     let unread: Int
+
+    var canSend: Bool { online && blocked == nil }
 }
 
 /// 本机身份：首次启动生成唯一 id，名字默认为电脑名称。
@@ -96,7 +101,15 @@ final class AppModel: ObservableObject {
         }
         store.failInterrupted()
 
-        node = ChatNode(id: identity.id, name: identity.name, host: myHost, downloadsDirectory: downloadsDirectory)
+        let identityKey: Curve25519.Signing.PrivateKey
+        do {
+            identityKey = try E2E.loadOrCreateIdentityKey(at: dataDirectory.appendingPathComponent("identity.key"))
+        } catch {
+            // 不静默重新生成：那会让所有联系人看到"密钥已变更"
+            fatalError("无法读取本机加密密钥 identity.key：\(error)")
+        }
+        node = ChatNode(id: identity.id, name: identity.name, host: myHost, downloadsDirectory: downloadsDirectory,
+                        identityKey: identityKey, pinnedKeys: store.pinnedKeys())
         node.onEvent = { [weak self] event in
             MainActor.assumeIsolated { self?.handle(event) }
         }
@@ -127,16 +140,18 @@ final class AppModel: ObservableObject {
     func sendText(_ raw: String) {
         let text = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty, let peerId = selectedPeerId, let info = reachable(peerId) else { return }
+        if let reason = blockReason(peerId) { alertMessage = reason; return }
         let msg = ChatMessage(peerId: peerId, outgoing: true, kind: .text, text: text, status: .sending)
         store.insert(msg)
         messages.append(msg)
-        node.sendText(msgId: msg.id, text: text, to: info.endpoint)
+        node.sendText(msgId: msg.id, text: text, to: info.endpoint, peerId: peerId)
         refreshPeers()
     }
 
     func sendFiles(_ urls: [URL]) {
         guard let peerId = selectedPeerId else { return }
         guard let info = reachable(peerId) else { alertMessage = "对方当前离线，无法发送文件。"; return }
+        if let reason = blockReason(peerId) { alertMessage = reason; return }
         var skipped: [String] = []
         for url in urls {
             var isDir: ObjCBool = false
@@ -149,7 +164,7 @@ final class AppModel: ObservableObject {
             store.insert(msg)
             messages.append(msg)
             progress[msg.id] = 0
-            node.sendFile(msgId: msg.id, fileURL: url, to: info.endpoint)
+            node.sendFile(msgId: msg.id, fileURL: url, to: info.endpoint, peerId: peerId)
         }
         if !skipped.isEmpty {
             alertMessage = "暂不支持发送文件夹，已跳过：\(skipped.joined(separator: "、"))\n可先压缩成 zip 再发送。"
@@ -160,15 +175,16 @@ final class AppModel: ObservableObject {
     func retry(_ msg: ChatMessage) {
         guard msg.outgoing, msg.status == .failed else { return }
         guard let info = reachable(msg.peerId) else { alertMessage = "对方当前离线，稍后再试。"; return }
+        if let reason = blockReason(msg.peerId) { alertMessage = reason; return }
         switch msg.kind {
         case .text:
-            node.sendText(msgId: msg.id, text: msg.text, to: info.endpoint)
+            node.sendText(msgId: msg.id, text: msg.text, to: info.endpoint, peerId: msg.peerId)
         case .file:
             guard let path = msg.filePath, FileManager.default.fileExists(atPath: path) else {
                 alertMessage = "原文件已不存在，无法重发。"; return
             }
             progress[msg.id] = 0
-            node.sendFile(msgId: msg.id, fileURL: URL(fileURLWithPath: path), to: info.endpoint)
+            node.sendFile(msgId: msg.id, fileURL: URL(fileURLWithPath: path), to: info.endpoint, peerId: msg.peerId)
         }
         setStatus(msg.id, .sending)
     }
@@ -181,7 +197,39 @@ final class AppModel: ObservableObject {
 
     func removePeer(_ peerId: String) {
         store.deletePeer(id: peerId)
+        node.unpin(peerId: peerId)  // 再次出现时按新设备重新记录公钥
         if peerId == selectedPeerId { selectedPeerId = nil }
+        refreshPeers()
+    }
+
+    // MARK: - 端到端加密
+
+    var myPublicKey: Data { node.publicKey }
+
+    /// 不能与对方通信的原因；nil 表示可以通信。
+    func blockReason(_ peerId: String) -> String? {
+        let name = online[peerId]?.name ?? storedPeers[peerId]?.name ?? "对方"
+        if storedPeers[peerId]?.pendingKey != nil {
+            return "「\(name)」的加密密钥已变更，通信已暂停。请与对方核对安全码后，在设备信息面板中选择\u{201C}信任新密钥\u{201D}。"
+        }
+        if let txt = online[peerId]?.txt, (Int(txt["ver"] ?? "") ?? 0) < E2E.protocolVersion {
+            return "「\(name)」使用的 LanChat 版本过旧，不支持端到端加密，请对方升级后再通信。"
+        }
+        return nil
+    }
+
+    /// 用户确认接受对方的新公钥。
+    func trustNewKey(_ peerId: String) {
+        guard let p = storedPeers[peerId], let key = p.pendingKey else { return }
+        store.pinPeerKey(id: peerId, name: p.name, key: key)
+        node.pin(peerId: peerId, key: key)
+        refreshPeers()
+        node.refreshInfo(peerId: peerId)
+    }
+
+    /// 标记已（或取消）与对方核对安全码。
+    func setKeyVerified(_ peerId: String, _ verified: Bool) {
+        store.setKeyVerified(id: peerId, verified)
         refreshPeers()
     }
 
@@ -268,6 +316,21 @@ final class AppModel: ObservableObject {
             if isUnreachable, let peerId = store.message(id: msgId)?.peerId {
                 markUnreachable(peerId)
             }
+        case .peerKeyLearned(let peerId, let name, let key):
+            store.pinPeerKey(id: peerId, name: online[peerId]?.name ?? name, key: key)
+            refreshPeers()
+        case .peerKeyMismatch(let peerId, let name, let key):
+            let alreadyPending = storedPeers[peerId]?.pendingKey == key
+            store.setPendingKey(id: peerId, key: key)
+            refreshPeers()
+            guard !alreadyPending else { break }
+            NSLog("LanChat peer %@ presented a different identity key: %@", peerId, E2E.fingerprint(key))
+            let shown = online[peerId]?.name ?? storedPeers[peerId]?.name ?? name
+            alertMessage = """
+                「\(shown)」出示的加密密钥与之前记录的不同，已拒绝与其通信。
+
+                可能是对方重装了 LanChat 或更换了电脑，也可能有人在冒充。请当面或电话与对方核对安全码，确认无误后在设备信息面板中选择\u{201C}信任新密钥\u{201D}。
+                """
         }
     }
 
@@ -313,7 +376,7 @@ final class AppModel: ObservableObject {
             return PeerRow(id: p.id, name: online[p.id]?.name ?? p.name,
                            host: online[p.id]?.host.nonEmpty ?? p.host, ip: addresses[p.id] ?? p.ip,
                            mac: d?.displayMAC ?? "", verdict: d?.verdict ?? .unknown,
-                           online: reachable(p.id) != nil,
+                           online: reachable(p.id) != nil, blocked: blockReason(p.id),
                            lastMessage: store.lastMessage(peerId: p.id), unread: store.unreadCount(peerId: p.id))
         }
         peers = rows.sorted { a, b in
@@ -347,7 +410,12 @@ final class AppModel: ObservableObject {
             observation: obs,
             ip: addresses[peerId] ?? p?.ip ?? "",
             arpMAC: obs?.arpMAC ?? p?.arpMAC.nonEmpty,
-            previousMACs: macChanged[peerId]
+            previousMACs: macChanged[peerId],
+            publicKey: p?.publicKey,
+            keyVerified: p?.keyVerified ?? false,
+            pendingKey: p?.pendingKey,
+            myPublicKey: myPublicKey,
+            outdated: online[peerId].map { (Int($0.txt["ver"] ?? "") ?? 0) < E2E.protocolVersion } ?? false
         )
     }
 

@@ -1,3 +1,4 @@
+import CryptoKit
 import Network
 import SQLite3
 import XCTest
@@ -16,9 +17,12 @@ final class ChatNodeTests: XCTestCase {
     }
 
     /// 启动一个不走 Bonjour 的节点，返回其监听端口。
-    private func startNode(_ id: String, events: @escaping (NodeEvent) -> Void) -> (ChatNode, NWEndpoint) {
+    private func startNode(_ id: String, key: Curve25519.Signing.PrivateKey = .init(),
+                           pinned: [String: Data] = [:],
+                           events: @escaping (NodeEvent) -> Void) -> (ChatNode, NWEndpoint) {
         let node = ChatNode(id: id, name: "Node-\(id)", host: "host-\(id)",
-                            downloadsDirectory: tmp.appendingPathComponent(id), discovery: false)
+                            downloadsDirectory: tmp.appendingPathComponent(id),
+                            identityKey: key, pinnedKeys: pinned, discovery: false)
         let ready = expectation(description: "\(id) listening")
         var port: UInt16 = 0
         node.onEvent = { e in
@@ -44,7 +48,7 @@ final class ChatNodeTests: XCTestCase {
         let (b, _) = startNode("B") { e in
             if case .outgoingDelivered("m1") = e { delivered.fulfill() }
         }
-        b.sendText(msgId: "m1", text: "你好，局域网 👋", to: endpointA)
+        b.sendText(msgId: "m1", text: "你好，局域网 👋", to: endpointA, peerId: "A")
         wait(for: [received, delivered], timeout: 5)
         XCTAssertEqual(got?.0, "你好，局域网 👋")
         XCTAssertEqual(got?.1, PeerRef(id: "B", name: "Node-B", host: "host-B"))
@@ -81,7 +85,7 @@ final class ChatNodeTests: XCTestCase {
             default: break
             }
         }
-        b.sendFile(msgId: "f1", fileURL: src, to: endpointA)
+        b.sendFile(msgId: "f1", fileURL: src, to: endpointA, peerId: "A")
         wait(for: [finished, delivered], timeout: 20)
         XCTAssertEqual(startedName, "报告 v1.bin")
         XCTAssertTrue(sawProgress)
@@ -94,7 +98,7 @@ final class ChatNodeTests: XCTestCase {
                 XCTAssertEqual(url.lastPathComponent, "报告 v1 (1).bin"); finished2.fulfill()
             }
         }
-        b.sendFile(msgId: "f2", fileURL: src, to: endpointA)
+        b.sendFile(msgId: "f2", fileURL: src, to: endpointA, peerId: "A")
         wait(for: [finished2], timeout: 20)
         a.stop(); b.stop()
     }
@@ -107,7 +111,7 @@ final class ChatNodeTests: XCTestCase {
         let (b, _) = startNode("B") { e in
             if case .outgoingDelivered("e1") = e { delivered.fulfill() }
         }
-        b.sendFile(msgId: "e1", fileURL: src, to: endpointA)
+        b.sendFile(msgId: "e1", fileURL: src, to: endpointA, peerId: "A")
         wait(for: [delivered], timeout: 5)
         a.stop(); b.stop()
     }
@@ -119,7 +123,7 @@ final class ChatNodeTests: XCTestCase {
                 XCTAssertTrue(unreachable, "连不上应标记为不可达"); failed.fulfill()
             }
         }
-        b.sendText(msgId: "x", text: "hi", to: .hostPort(host: "127.0.0.1", port: 1))
+        b.sendText(msgId: "x", text: "hi", to: .hostPort(host: "127.0.0.1", port: 1), peerId: "A")
         wait(for: [failed], timeout: 15)
         b.stop()
     }
@@ -132,7 +136,7 @@ final class ChatNodeTests: XCTestCase {
                 XCTAssertFalse(unreachable, "本地文件问题不应把对方判为离线"); failed.fulfill()
             }
         }
-        b.sendFile(msgId: "nf", fileURL: tmp.appendingPathComponent("不存在.txt"), to: endpointA)
+        b.sendFile(msgId: "nf", fileURL: tmp.appendingPathComponent("不存在.txt"), to: endpointA, peerId: "A")
         wait(for: [failed], timeout: 5)
         a.stop(); b.stop()
     }
@@ -171,6 +175,155 @@ final class ChatNodeTests: XCTestCase {
         XCTAssertEqual(obsOfB?.info?.deviceId, "B", "握手是双向的：被查询方也拿到查询方的信息")
         XCTAssertFalse(obsOfB?.outbound ?? true)
         a.stop(); b.stop()
+    }
+
+    // MARK: 端到端加密
+
+    func testHandshakePinsKeysOnBothSides() {
+        let keyA = Curve25519.Signing.PrivateKey(), keyB = Curve25519.Signing.PrivateKey()
+        let aLearned = expectation(description: "A 记住 B 的公钥")
+        let bLearned = expectation(description: "B 记住 A 的公钥")
+        let delivered = expectation(description: "delivered")
+        let (a, endpointA) = startNode("A", key: keyA) { e in
+            if case .peerKeyLearned("B", "Node-B", let k) = e {
+                XCTAssertEqual(k, keyB.publicKey.rawRepresentation); aLearned.fulfill()
+            }
+        }
+        let (b, _) = startNode("B", key: keyB) { e in
+            if case .peerKeyLearned("A", "Node-A", let k) = e {
+                XCTAssertEqual(k, keyA.publicKey.rawRepresentation); bLearned.fulfill()
+            }
+            if case .outgoingDelivered("k1") = e { delivered.fulfill() }
+        }
+        b.sendText(msgId: "k1", text: "hi", to: endpointA, peerId: "A")
+        wait(for: [aLearned, bLearned, delivered], timeout: 5)
+        a.stop(); b.stop()
+    }
+
+    /// 接收方记住的 B 公钥与实际不同 → 拒绝，并上报密钥变更；发送方失败但不判为不可达。
+    func testReceiverRejectsChangedKey() {
+        let mismatch = expectation(description: "A 发现 B 的密钥变了")
+        let failed = expectation(description: "B 发送失败")
+        let (a, endpointA) = startNode("A", pinned: ["B": Curve25519.Signing.PrivateKey().publicKey.rawRepresentation]) { e in
+            if case .peerKeyMismatch("B", _, _) = e { mismatch.fulfill() }
+            if case .incomingText = e { XCTFail("密钥不符时不应收下消息") }
+        }
+        let (b, _) = startNode("B") { e in
+            if case .outgoingFailed("km", _, let unreachable) = e { XCTAssertFalse(unreachable); failed.fulfill() }
+        }
+        b.sendText(msgId: "km", text: "hi", to: endpointA, peerId: "A")
+        wait(for: [mismatch, failed], timeout: 5)
+        a.stop(); b.stop()
+    }
+
+    /// 发送方记住的 A 公钥与实际不同（有人冒充 A）→ 不发送内容。
+    func testSenderRejectsChangedKey() {
+        let mismatch = expectation(description: "B 发现 A 的密钥变了")
+        let failed = expectation(description: "B 发送失败")
+        let (a, endpointA) = startNode("A") { e in
+            if case .incomingText("km2", _, _) = e { XCTFail("密钥不符时不应发出消息") }
+        }
+        let (b, _) = startNode("B", pinned: ["A": Curve25519.Signing.PrivateKey().publicKey.rawRepresentation]) { e in
+            if case .peerKeyMismatch("A", _, _) = e { mismatch.fulfill() }
+            if case .outgoingFailed("km2", let reason, _) = e {
+                XCTAssertTrue(reason.contains("密钥已变更"), reason); failed.fulfill()
+            }
+        }
+        b.sendText(msgId: "km2", text: "hi", to: endpointA, peerId: "A")
+        wait(for: [mismatch, failed], timeout: 5)
+
+        // 用户确认信任新密钥后恢复通信
+        let delivered = expectation(description: "delivered")
+        b.onEvent = { if case .outgoingDelivered("km3") = $0 { delivered.fulfill() } }
+        b.pin(peerId: "A", key: a.publicKey)
+        b.sendText(msgId: "km3", text: "hi", to: endpointA, peerId: "A")
+        wait(for: [delivered], timeout: 5)
+        a.stop(); b.stop()
+    }
+
+    /// 端点上的设备不是预期的那台 → 拒绝。
+    func testSenderRejectsUnexpectedPeer() {
+        let failed = expectation(description: "failed")
+        let (a, endpointA) = startNode("A") { e in
+            if case .incomingText = e { XCTFail("不应发出消息") }
+        }
+        let (b, _) = startNode("B") { e in
+            if case .outgoingFailed("wp", let reason, _) = e {
+                XCTAssertTrue(reason.contains("与预期不符"), reason); failed.fulfill()
+            }
+        }
+        b.sendText(msgId: "wp", text: "hi", to: endpointA, peerId: "C")
+        wait(for: [failed], timeout: 5)
+        a.stop(); b.stop()
+    }
+
+    /// 旧版明文协议的 text 帧不被接受。
+    func testPlaintextFrameRejected() {
+        let (a, endpointA) = startNode("A") { e in
+            if case .incomingText = e { XCTFail("不应接受明文消息") }
+        }
+        let closed = expectation(description: "connection closed without ack")
+        let conn = NWConnection(to: endpointA, using: .tcp)
+        conn.stateUpdateHandler = { state in
+            guard case .ready = state else { return }
+            let h = Header(type: .text, msgId: "plain", fromId: "old", fromName: "旧版", text: "明文")
+            conn.send(content: Wire.frame(h), completion: .contentProcessed { _ in })
+            Wire.readRecord(conn) { result in
+                if case .success = result { XCTFail("不应收到任何应答") }
+                closed.fulfill()
+            }
+        }
+        conn.start(queue: .global())
+        wait(for: [closed], timeout: 5)
+        conn.cancel(); a.stop()
+    }
+
+    func testSecureChannelDetectsTampering() throws {
+        let c = try E2E.makeClientHello(deviceId: "B", identity: .init())
+        let (reply, server, peer) = try E2E.respond(to: c.hello, deviceId: "A", identity: .init())
+        XCTAssertEqual(peer.deviceId, "B")
+        let (client, serverPeer) = try E2E.finish(c, reply: reply)
+        XCTAssertEqual(serverPeer.deviceId, "A")
+
+        let sealed = try client.seal(Data("机密".utf8))
+        XCTAssertNil(sealed.range(of: Data("机密".utf8)), "密文中不应出现明文")
+        XCTAssertEqual(try server.open(sealed), Data("机密".utf8))
+        XCTAssertThrowsError(try server.open(sealed), "重放同一条记录应失败")
+
+        var tampered = try client.seal(Data("hello".utf8))
+        tampered[0] ^= 1
+        XCTAssertThrowsError(try server.open(tampered))
+    }
+
+    func testForgedHelloRejected() throws {
+        let c = try E2E.makeClientHello(deviceId: "B", identity: .init())
+        var forged = c.hello
+        forged.deviceId = "A"   // 改设备 ID，签名不再匹配
+        XCTAssertThrowsError(try E2E.respond(to: forged, deviceId: "S", identity: .init()))
+
+        // 中间人替换应答方的临时公钥
+        let (reply, _, _) = try E2E.respond(to: c.hello, deviceId: "A", identity: .init())
+        var mitm = reply
+        mitm.ephemeralKey = Curve25519.KeyAgreement.PrivateKey().publicKey.rawRepresentation
+        XCTAssertThrowsError(try E2E.finish(c, reply: mitm))
+    }
+
+    func testSafetyCodeIsSymmetric() {
+        let a = Curve25519.Signing.PrivateKey().publicKey.rawRepresentation
+        let b = Curve25519.Signing.PrivateKey().publicKey.rawRepresentation
+        XCTAssertEqual(E2E.safetyCode(a, b), E2E.safetyCode(b, a))
+        XCTAssertEqual(E2E.safetyCode(a, b).split(separator: " ").count, 8)
+        XCTAssertNotEqual(E2E.safetyCode(a, b), E2E.safetyCode(a, a))
+        XCTAssertEqual(E2E.fingerprint(a).count, 39)
+    }
+
+    func testIdentityKeyFile() throws {
+        let url = tmp.appendingPathComponent("sub/identity.key")
+        let k1 = try E2E.loadOrCreateIdentityKey(at: url)
+        let k2 = try E2E.loadOrCreateIdentityKey(at: url)
+        XCTAssertEqual(k1.rawRepresentation, k2.rawRepresentation)
+        let perms = try FileManager.default.attributesOfItem(atPath: url.path)[.posixPermissions] as? NSNumber
+        XCTAssertEqual(perms?.intValue, 0o600)
     }
 
     func testIPString() {
@@ -235,6 +388,24 @@ final class ChatStoreTests: XCTestCase {
         XCTAssertEqual(store.peers().first?.arpMAC, "aa:bb:cc:dd:ee:ff")
         XCTAssertNotNil(store.peers().first?.infoAt)
 
+        // 公钥：首次信任 → 核对 → 出现新公钥 → 用户信任新公钥（清除核对状态）
+        let k1 = Data(repeating: 1, count: 32), k2 = Data(repeating: 2, count: 32)
+        XCTAssertNil(store.peers().first?.publicKey)
+        store.pinPeerKey(id: "p1", name: "忽略", key: k1)
+        XCTAssertEqual(store.peers().first?.name, "老王的 Mac", "已存在的联系人不改名")
+        store.setKeyVerified(id: "p1", true)
+        XCTAssertEqual(store.peers().first?.keyVerified, true)
+        store.setPendingKey(id: "p1", key: k2)
+        XCTAssertEqual(store.peers().first?.publicKey, k1)
+        XCTAssertEqual(store.peers().first?.pendingKey, k2)
+        store.pinPeerKey(id: "p1", name: "", key: k2)
+        XCTAssertEqual(store.peers().first?.publicKey, k2)
+        XCTAssertNil(store.peers().first?.pendingKey)
+        XCTAssertEqual(store.peers().first?.keyVerified, false)
+        store.pinPeerKey(id: "new", name: "新设备", key: k1)
+        XCTAssertEqual(store.pinnedKeys(), ["p1": k2, "new": k1])
+        store.deletePeer(id: "new")
+
         store.deletePeer(id: "p1")
         XCTAssertTrue(store.peers().isEmpty)
         XCTAssertTrue(store.messages(peerId: "p1").isEmpty)
@@ -256,6 +427,8 @@ final class ChatStoreMigrationTests: XCTestCase {
         XCTAssertEqual(store.peers().first?.host, "")
         store.updatePeerIP(id: "p", ip: "10.1.1.1")
         XCTAssertEqual(store.peers().first?.ip, "10.1.1.1")
+        XCTAssertNil(store.peers().first?.publicKey, "旧联系人没有公钥，下次连接按首次见到处理")
+        XCTAssertTrue(store.pinnedKeys().isEmpty)
     }
 }
 
@@ -282,7 +455,7 @@ final class BonjourDiscoveryTests: XCTestCase {
         }
         a.start(); b.start()
         wait(for: [found], timeout: 15)
-        b.sendText(msgId: "ping1", text: "ping", to: endpointOfA!)
+        b.sendText(msgId: "ping1", text: "ping", to: endpointOfA!, peerId: a.id)
         wait(for: [got, resolved], timeout: 10)
         print("Bonjour 解析到的对方 IP：\(ipOfA ?? "-")")
         XCTAssertNotNil(ipOfA)

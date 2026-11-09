@@ -12,8 +12,10 @@ struct IdentityCheck: Identifiable, Equatable {
 
 /// 身份总评，用于列表里的小盾牌。
 enum IdentityVerdict: Equatable {
-    case verified   // ARP 实测 MAC 与对方自报一致，且无告警
+    case keyChanged // 对方加密密钥变更，通信已阻断
     case warning    // 至少一项不一致
+    case verified   // 已与对方核对安全码（密码学意义上的确认），且无告警
+    case matched    // 未核对安全码，但 ARP 实测 MAC 与对方自报一致
     case unknown    // 信息不足
 }
 
@@ -36,6 +38,17 @@ struct PeerDetail {
     let arpMAC: String?
     /// 与上次记录相比 MAC 全部变了：上次的 MAC 集合
     let previousMACs: Set<String>?
+    /// 已信任的对方身份公钥
+    let publicKey: Data?
+    let keyVerified: Bool
+    /// 对方出示的新公钥（待确认）
+    let pendingKey: Data?
+    let myPublicKey: Data
+    /// 对方广播的协议版本低于本机（不支持加密）
+    let outdated: Bool
+
+    /// 双方的安全码（尚未握手时为 nil）
+    var safetyCode: String? { publicKey.map { E2E.safetyCode($0, myPublicKey) } }
 
     /// 列表和标题里显示的 MAC：优先 ARP 实测，其次对方自报的、与连接 IP 同网卡的 MAC，最后用广播里的
     var displayMAC: String {
@@ -45,6 +58,22 @@ struct PeerDetail {
     var checks: [IdentityCheck] {
         var out: [IdentityCheck] = []
         let reported = info?.macs ?? []
+
+        // 0. 端到端加密
+        if let pendingKey {
+            out.append(.init(id: "e2e", title: "加密密钥", state: .warn,
+                             detail: "对方出示了新的身份公钥（\(E2E.fingerprint(pendingKey))），与之前记录的不同，通信已阻断"))
+        } else if outdated {
+            out.append(.init(id: "e2e", title: "加密密钥", state: .warn,
+                             detail: "对方的 LanChat 版本过旧，不支持端到端加密，无法通信"))
+        } else if publicKey != nil {
+            out.append(keyVerified
+                ? .init(id: "e2e", title: "加密密钥", state: .pass, detail: "端到端加密，已与对方核对安全码")
+                : .init(id: "e2e", title: "加密密钥", state: .unknown,
+                        detail: "端到端加密。首次连接时记录了对方公钥，尚未核对安全码"))
+        } else {
+            out.append(.init(id: "e2e", title: "加密密钥", state: .unknown, detail: "尚未与对方完成加密握手"))
+        }
 
         // 1. ARP 实测 MAC vs 自报
         if let arp = arpMAC.map(MAC.normalize) {
@@ -103,9 +132,11 @@ struct PeerDetail {
     }
 
     var verdict: IdentityVerdict {
+        if pendingKey != nil { return .keyChanged }
         let c = checks
         if c.contains(where: { $0.state == .warn }) { return .warning }
-        if c.first(where: { $0.id == "mac" })?.state == .pass { return .verified }
+        if keyVerified { return .verified }
+        if c.first(where: { $0.id == "mac" })?.state == .pass { return .matched }
         return .unknown
     }
 

@@ -1,3 +1,4 @@
+import CryptoKit
 import Foundation
 import Network
 
@@ -55,9 +56,13 @@ public enum NodeEvent {
     case outgoingDelivered(msgId: String)
     /// unreachable = 连接根本没建立起来（对方很可能已掉线），区别于读文件失败等本地原因。
     case outgoingFailed(msgId: String, reason: String, unreachable: Bool)
+    /// 首次与对方完成加密握手，记住了对方的身份公钥（TOFU），应持久化。
+    case peerKeyLearned(peerId: String, name: String, key: Data)
+    /// 对方的身份公钥与记住的不一致，连接已被拒绝。需用户确认后调用 `pin` 才能恢复通信。
+    case peerKeyMismatch(peerId: String, name: String, key: Data)
 }
 
-/// 局域网节点：Bonjour 广播 + 发现，TCP 收发文本和文件。
+/// 局域网节点：Bonjour 广播 + 发现，TCP 收发文本和文件，全部连接端到端加密（见 `E2E`）。
 /// 所有网络工作在内部串行队列执行，事件回调 `onEvent` 在主线程派发。
 public final class ChatNode {
     public static let serviceType = "_lanchat._tcp"
@@ -76,14 +81,37 @@ public final class ChatNode {
     private var browser: NWBrowser?
     private var stopped = false
     private var listenPort: UInt16?
+    private let identityKey: Curve25519.Signing.PrivateKey
+    /// 已信任的对方身份公钥：设备 id → 公钥（只在 queue 上访问）
+    private var pinned: [String: Data]
 
-    /// - Parameter discovery: 是否启用 Bonjour 广播与发现（测试时可关闭，直接用 host:port 互连）。
-    public init(id: String, name: String, host: String = "", downloadsDirectory: URL, discovery: Bool = true) {
+    /// 本机身份公钥
+    public var publicKey: Data { identityKey.publicKey.rawRepresentation }
+
+    /// - Parameters:
+    ///   - identityKey: 本机长期身份私钥（测试可省略，随机生成）。
+    ///   - pinnedKeys: 已信任的对方公钥，启动前从存储载入。
+    ///   - discovery: 是否启用 Bonjour 广播与发现（测试时可关闭，直接用 host:port 互连）。
+    public init(id: String, name: String, host: String = "", downloadsDirectory: URL,
+                identityKey: Curve25519.Signing.PrivateKey = .init(), pinnedKeys: [String: Data] = [:],
+                discovery: Bool = true) {
         self.id = id
         self.name = name
         self.host = host
         self.downloadsDirectory = downloadsDirectory
+        self.identityKey = identityKey
+        self.pinned = pinnedKeys
         self.discovery = discovery
+    }
+
+    /// 信任对方的公钥（用户确认密钥变更后调用）。
+    public func pin(peerId: String, key: Data) {
+        queue.async { self.pinned[peerId] = key }
+    }
+
+    /// 忘记对方的公钥，下次连接重新按首次见到处理。
+    public func unpin(peerId: String) {
+        queue.async { self.pinned[peerId] = nil }
     }
 
     public func start() {
@@ -112,7 +140,7 @@ public final class ChatNode {
     // MARK: - Listener / Browser
 
     private func makeService() -> NWListener.Service {
-        var dict = ["id": id, "name": name, "host": host, "ver": "2"]
+        var dict = ["id": id, "name": name, "host": host, "ver": "\(E2E.protocolVersion)"]
         let primary = LocalDevice.interfaces().first { $0.name.hasPrefix("en") && !$0.ipv4.isEmpty }
         if let mac = primary?.mac ?? primary?.hardwareMAC { dict["mac"] = mac }
         let txt = NWTXTRecord(dict)
@@ -235,10 +263,11 @@ public final class ChatNode {
         }
         let conn = NWConnection(to: endpoint, using: params)
         let once = Once()
-        let done: (PeerObservation?) -> Void = { [weak self] obs in
+        /// obs 为 nil：连接没建立（IPv4 失败时改试任意地址）；dropped：身份校验未通过，不记录任何信息
+        let done: (PeerObservation?, Bool) -> Void = { [weak self] obs, dropped in
             guard once.fire() else { return }
             conn.cancel()
-            guard let self else { return }
+            guard let self, !dropped else { return }
             if let obs {
                 if let ip = obs.ip { self.emit(.peerAddress(peerId: peerId, ip: ip)) }
                 self.emit(.peerObserved(peerId: peerId, obs))
@@ -251,24 +280,36 @@ public final class ChatNode {
             switch state {
             case .ready:
                 var obs = self.observe(conn, outbound: true)
-                let t0 = Date()
-                conn.send(content: Wire.frame(self.infoHeader()), completion: .contentProcessed { _ in })
-                Wire.readHeader(conn) { result in
-                    if case .success(let h) = result, h.type == .info {
-                        obs.info = h.info
-                        obs.rttMs = Date().timeIntervalSince(t0) * 1000
-                    }
+                let finish = {
                     // 连接后 ARP 表才有对方条目，读取放在应答之后更可靠
                     if obs.arpMAC == nil, let ip = obs.ip, !ip.contains(":") { obs.arpMAC = ARPTable.mac(for: ip) }
-                    done(obs)
+                    done(obs, false)
                 }
-            case .waiting, .failed: done(nil)
+                self.clientHandshake(conn, expectedPeer: peerId) { result in
+                    let channel: SecureChannel
+                    switch result {
+                    case .success(let c): channel = c
+                    case .failure(.legacyPeer): finish(); return  // 旧版本：仍记录 IP 等实测信息
+                    case .failure: done(nil, true); return
+                    }
+                    guard let frame = try? Wire.secureFrame(self.infoHeader(), channel) else { finish(); return }
+                    let t0 = Date()
+                    conn.send(content: frame, completion: .contentProcessed { _ in })
+                    Wire.readSecureHeader(conn, channel) { result in
+                        if case .success(let h) = result, h.type == .info {
+                            obs.info = h.info
+                            obs.rttMs = Date().timeIntervalSince(t0) * 1000
+                        }
+                        finish()
+                    }
+                }
+            case .waiting, .failed: done(nil, false)
             case .cancelled: conn.stateUpdateHandler = nil
             default: break
             }
         }
         conn.start(queue: queue)
-        queue.asyncAfter(deadline: .now() + 6) { done(nil) }
+        queue.asyncAfter(deadline: .now() + 6) { done(nil, false) }
     }
 
     /// 从连接对端端点提取便于显示的 IP 文本（IPv4 映射地址转回 IPv4，去掉 IPv6 的 %接口 后缀）。
@@ -285,6 +326,71 @@ public final class ChatNode {
         return text.components(separatedBy: "%")[0]
     }
 
+    // MARK: - Handshake
+
+    private func helloHeader(_ hello: Hello) -> Header {
+        Header(type: .hello, msgId: UUID().uuidString, fromId: id, fromName: name, fromHost: host, hello: hello)
+    }
+
+    /// 信任检查（TOFU）：首次见到的设备记住公钥；与已记住的不同则拒绝并上报。
+    private func trust(_ peer: E2E.PeerIdentity, name: String) -> Bool {
+        guard peer.deviceId != id else { return false }
+        if let known = pinned[peer.deviceId] {
+            if known == peer.publicKey { return true }
+            emit(.peerKeyMismatch(peerId: peer.deviceId, name: name, key: peer.publicKey))
+            return false
+        }
+        pinned[peer.deviceId] = peer.publicKey
+        emit(.peerKeyLearned(peerId: peer.deviceId, name: name, key: peer.publicKey))
+        return true
+    }
+
+    enum HandshakeFailure: Error {
+        /// 对方没有回 hello：多半是不支持加密的旧版本
+        case legacyPeer
+        case rejected(String)
+
+        var reason: String {
+            switch self {
+            case .legacyPeer: return "加密握手失败：对方可能是不支持端到端加密的旧版本，请对方升级"
+            case .rejected(let r): return r
+            }
+        }
+    }
+
+    /// 发起方握手：要求应答方必须是 expectedPeer，且公钥通过信任检查。
+    private func clientHandshake(_ conn: NWConnection, expectedPeer: String,
+                                 _ completion: @escaping (Result<SecureChannel, HandshakeFailure>) -> Void) {
+        let once = Once()
+        let complete: (Result<SecureChannel, HandshakeFailure>) -> Void = { r in
+            if once.fire() { completion(r) }
+        }
+        guard let state = try? E2E.makeClientHello(deviceId: id, identity: identityKey) else {
+            complete(.failure(.rejected("无法生成加密握手数据"))); return
+        }
+        conn.send(content: Wire.frame(helloHeader(state.hello)), completion: .contentProcessed { error in
+            if let error { complete(.failure(.rejected(error.localizedDescription))) }
+        })
+        Wire.readHeader(conn) { [weak self] result in
+            guard let self else { return }
+            guard case .success(let h) = result, h.type == .hello, let reply = h.hello else {
+                complete(.failure(.legacyPeer)); return
+            }
+            guard let (channel, peer) = Self.unwrap({ try E2E.finish(state, reply: reply) }) else {
+                complete(.failure(.rejected("加密握手失败：对方签名无效"))); return
+            }
+            guard peer.deviceId == expectedPeer else {
+                complete(.failure(.rejected("对方设备 ID 与预期不符，已拒绝连接"))); return
+            }
+            guard self.trust(peer, name: h.fromName) else {
+                complete(.failure(.rejected("对方的加密密钥已变更，需在设备信息中确认后才能通信"))); return
+            }
+            complete(.success(channel))
+        }
+    }
+
+    private static func unwrap<T>(_ body: () throws -> T) -> T? { try? body() }
+
     // MARK: - Incoming
 
     private func acceptIncoming(_ conn: NWConnection) {
@@ -296,35 +402,52 @@ public final class ChatNode {
             }
         }
         conn.start(queue: queue)
+        // 首帧必须是 hello；旧版明文协议直接断开
         Wire.readHeader(conn) { [weak self] result in
-            guard let self, case .success(let h) = result else { conn.cancel(); return }
-            let from = PeerRef(id: h.fromId, name: h.fromName, host: h.fromHost ?? "")
-            if !h.fromId.isEmpty, let ip = Self.ipString(conn.currentPath?.remoteEndpoint ?? conn.endpoint) {
-                self.emit(.peerAddress(peerId: h.fromId, ip: ip))
-            }
-            switch h.type {
-            case .text:
-                self.emit(.incomingText(msgId: h.msgId, from: from, text: h.text ?? ""))
-                self.sendAck(h.msgId, on: conn)
-            case .file:
-                self.receiveFile(h, from: from, on: conn)
-            case .info:
-                var obs = self.observe(conn, outbound: false)
-                obs.info = h.info
-                conn.send(content: Wire.frame(self.infoHeader()), completion: .contentProcessed { _ in conn.cancel() })
-                if !h.fromId.isEmpty { self.emit(.peerObserved(peerId: h.fromId, obs)) }
-            case .ack:
-                conn.cancel()
+            guard let self, case .success(let h) = result, h.type == .hello, let hello = h.hello,
+                  let (reply, channel, peer) = Self.unwrap({
+                      try E2E.respond(to: hello, deviceId: self.id, identity: self.identityKey)
+                  }),
+                  self.trust(peer, name: h.fromName) else { conn.cancel(); return }
+            conn.send(content: Wire.frame(self.helloHeader(reply)), completion: .contentProcessed { _ in })
+            Wire.readSecureHeader(conn, channel) { [weak self] result in
+                guard let self, case .success(let h) = result else { conn.cancel(); return }
+                self.dispatch(h, peerId: peer.deviceId, channel, on: conn)
             }
         }
     }
 
-    private func sendAck(_ msgId: String, on conn: NWConnection) {
-        conn.send(content: Wire.frame(Header(type: .ack, msgId: msgId)),
-                  completion: .contentProcessed { _ in conn.cancel() })
+    /// 处理握手后的第一个加密帧。发送方身份以握手为准，忽略帧里自称的 fromId。
+    private func dispatch(_ h: Header, peerId: String, _ channel: SecureChannel, on conn: NWConnection) {
+        let from = PeerRef(id: peerId, name: h.fromName, host: h.fromHost ?? "")
+        if let ip = Self.ipString(conn.currentPath?.remoteEndpoint ?? conn.endpoint) {
+            emit(.peerAddress(peerId: peerId, ip: ip))
+        }
+        switch h.type {
+        case .text:
+            emit(.incomingText(msgId: h.msgId, from: from, text: h.text ?? ""))
+            sendAck(h.msgId, channel, on: conn)
+        case .file:
+            receiveFile(h, from: from, channel, on: conn)
+        case .info:
+            var obs = observe(conn, outbound: false)
+            obs.info = h.info
+            guard let frame = try? Wire.secureFrame(infoHeader(), channel) else { conn.cancel(); return }
+            conn.send(content: frame, completion: .contentProcessed { _ in conn.cancel() })
+            emit(.peerObserved(peerId: peerId, obs))
+        case .ack, .hello:
+            conn.cancel()
+        }
     }
 
-    private func receiveFile(_ h: Header, from: PeerRef, on conn: NWConnection) {
+    private func sendAck(_ msgId: String, _ channel: SecureChannel, on conn: NWConnection) {
+        guard let frame = try? Wire.secureFrame(Header(type: .ack, msgId: msgId), channel) else {
+            conn.cancel(); return
+        }
+        conn.send(content: frame, completion: .contentProcessed { _ in conn.cancel() })
+    }
+
+    private func receiveFile(_ h: Header, from: PeerRef, _ channel: SecureChannel, on conn: NWConnection) {
         guard let size = h.fileSize, size >= 0 else { conn.cancel(); return }
         let fileName = Self.sanitize(h.fileName ?? "")
         let fm = FileManager.default
@@ -340,12 +463,12 @@ public final class ChatNode {
         }
         emit(.incomingFileStarted(msgId: h.msgId, from: from, fileName: fileName, size: size, url: url))
 
-        let receiver = FileReceiver(conn: conn, handle: handle, size: size) { [weak self] ok in
+        let receiver = FileReceiver(conn: conn, channel: channel, handle: handle, size: size) { [weak self] ok in
             guard let self else { return }
             if ok {
                 self.emit(.transferProgress(msgId: h.msgId, fraction: 1))
                 self.emit(.incomingFileFinished(msgId: h.msgId, url: url))
-                self.sendAck(h.msgId, on: conn)
+                self.sendAck(h.msgId, channel, on: conn)
             } else {
                 try? fm.removeItem(at: url)
                 self.emit(.incomingFileFailed(msgId: h.msgId))
@@ -359,20 +482,22 @@ public final class ChatNode {
 
     // MARK: - Outgoing
 
-    public func sendText(msgId: String, text: String, to endpoint: NWEndpoint) {
+    /// 发送文本。peerId 是预期的接收方：握手时对方必须证明自己是这台设备。
+    public func sendText(msgId: String, text: String, to endpoint: NWEndpoint, peerId: String) {
         queue.async {
             let header = Header(type: .text, msgId: msgId, fromId: self.id, fromName: self.name,
                                 fromHost: self.host, text: text)
-            self.openConnection(to: endpoint, msgId: msgId) { conn, complete in
-                conn.send(content: Wire.frame(header), completion: .contentProcessed { error in
+            self.openConnection(to: endpoint, peerId: peerId, msgId: msgId) { conn, channel, complete in
+                guard let frame = try? Wire.secureFrame(header, channel) else { complete(false, "加密失败"); return }
+                conn.send(content: frame, completion: .contentProcessed { error in
                     if let error { complete(false, error.localizedDescription); return }
-                    Self.awaitAck(conn, msgId: msgId, complete)
+                    Self.awaitAck(conn, channel, msgId: msgId, complete)
                 })
             }
         }
     }
 
-    public func sendFile(msgId: String, fileURL: URL, to endpoint: NWEndpoint) {
+    public func sendFile(msgId: String, fileURL: URL, to endpoint: NWEndpoint, peerId: String) {
         queue.async {
             guard let attrs = try? FileManager.default.attributesOfItem(atPath: fileURL.path),
                   let size = (attrs[.size] as? NSNumber)?.int64Value,
@@ -381,11 +506,13 @@ public final class ChatNode {
             }
             let header = Header(type: .file, msgId: msgId, fromId: self.id, fromName: self.name,
                                 fromHost: self.host, fileName: fileURL.lastPathComponent, fileSize: size)
-            self.openConnection(to: endpoint, msgId: msgId, onFail: { try? handle.close() }) { conn, complete in
-                conn.send(content: Wire.frame(header), completion: .contentProcessed { error in
+            self.openConnection(to: endpoint, peerId: peerId, msgId: msgId,
+                                onFail: { try? handle.close() }) { conn, channel, complete in
+                guard let frame = try? Wire.secureFrame(header, channel) else { complete(false, "加密失败"); return }
+                conn.send(content: frame, completion: .contentProcessed { error in
                     if let error { try? handle.close(); complete(false, error.localizedDescription); return }
-                    let sender = FileSender(conn: conn, handle: handle, size: size) { ok, reason in
-                        if ok { Self.awaitAck(conn, msgId: msgId, complete) } else { complete(false, reason) }
+                    let sender = FileSender(conn: conn, channel: channel, handle: handle, size: size) { ok, reason in
+                        if ok { Self.awaitAck(conn, channel, msgId: msgId, complete) } else { complete(false, reason) }
                     } progress: { fraction in
                         self.emit(.transferProgress(msgId: msgId, fraction: fraction))
                     }
@@ -397,8 +524,9 @@ public final class ChatNode {
 
     private typealias Completion = (Bool, String?) -> Void
 
-    private static func awaitAck(_ conn: NWConnection, msgId: String, _ complete: @escaping Completion) {
-        Wire.readHeader(conn) { result in
+    private static func awaitAck(_ conn: NWConnection, _ channel: SecureChannel, msgId: String,
+                                 _ complete: @escaping Completion) {
+        Wire.readSecureHeader(conn, channel) { result in
             if case .success(let h) = result, h.type == .ack, h.msgId == msgId {
                 complete(true, nil)
             } else {
@@ -407,8 +535,9 @@ public final class ChatNode {
         }
     }
 
-    private func openConnection(to endpoint: NWEndpoint, msgId: String, onFail: (() -> Void)? = nil,
-                                ready: @escaping (NWConnection, @escaping Completion) -> Void) {
+    /// 建立连接并完成加密握手后调用 ready。握手失败不算"不可达"（连接已建立）。
+    private func openConnection(to endpoint: NWEndpoint, peerId: String, msgId: String, onFail: (() -> Void)? = nil,
+                                ready: @escaping (NWConnection, SecureChannel, @escaping Completion) -> Void) {
         let conn = NWConnection(to: endpoint, using: .tcp)
         let once = Once()
         var started = false
@@ -424,11 +553,17 @@ public final class ChatNode {
             case .ready:
                 if !started {
                     started = true
-                    if let pid = self.visible.first(where: { $0.value == endpoint })?.key,
-                       let ip = Self.ipString(conn.currentPath?.remoteEndpoint) {
-                        self.emit(.peerAddress(peerId: pid, ip: ip))
+                    self.clientHandshake(conn, expectedPeer: peerId) { result in
+                        switch result {
+                        case .success(let channel):
+                            if let ip = Self.ipString(conn.currentPath?.remoteEndpoint) {
+                                self.emit(.peerAddress(peerId: peerId, ip: ip))
+                            }
+                            ready(conn, channel, complete)
+                        case .failure(let f):
+                            complete(false, f.reason)
+                        }
                     }
-                    ready(conn, complete)
                 }
             case .waiting(let error):
                 complete(false, "无法连接：\(error.localizedDescription)")
@@ -501,9 +636,10 @@ public final class ChatNode {
     }
 }
 
-/// 从连接读取固定长度的文件数据并写盘。
+/// 从连接读取加密分块并写盘，明文合计 size 字节。
 private final class FileReceiver {
     let conn: NWConnection
+    let channel: SecureChannel
     let handle: FileHandle
     let size: Int64
     let done: (Bool) -> Void
@@ -511,9 +647,9 @@ private final class FileReceiver {
     var received: Int64 = 0
     let throttle = ProgressThrottle()
 
-    init(conn: NWConnection, handle: FileHandle, size: Int64,
+    init(conn: NWConnection, channel: SecureChannel, handle: FileHandle, size: Int64,
          done: @escaping (Bool) -> Void, progress: @escaping (Double) -> Void) {
-        self.conn = conn; self.handle = handle; self.size = size
+        self.conn = conn; self.channel = channel; self.handle = handle; self.size = size
         self.done = done; self.progress = progress
     }
 
@@ -524,25 +660,24 @@ private final class FileReceiver {
 
     func pump() {
         if received >= size { finish(true); return }
-        let want = Int(min(Int64(1 << 20), size - received))
-        conn.receive(minimumIncompleteLength: 1, maximumLength: want) { [self] data, _, isComplete, error in
-            if let data, !data.isEmpty {
-                do { try handle.write(contentsOf: data) } catch { finish(false); return }
-                received += Int64(data.count)
-                if throttle.shouldEmit(done: received, total: size), size > 0 {
-                    progress(Double(received) / Double(size))
-                }
+        Wire.readSecure(conn, channel) { [self] result in
+            // 解密失败（被篡改）、连接中断、或数据超出声明大小，都按失败处理
+            guard case .success(let data) = result, !data.isEmpty,
+                  received + Int64(data.count) <= size else { finish(false); return }
+            do { try handle.write(contentsOf: data) } catch { finish(false); return }
+            received += Int64(data.count)
+            if throttle.shouldEmit(done: received, total: size) {
+                progress(Double(received) / Double(size))
             }
-            if received >= size { finish(true); return }
-            if error != nil || isComplete { finish(false); return }
             pump()
         }
     }
 }
 
-/// 分块读取本地文件并写入连接。
+/// 分块读取本地文件，加密后写入连接。
 private final class FileSender {
     let conn: NWConnection
+    let channel: SecureChannel
     let handle: FileHandle
     let size: Int64
     let done: (Bool, String?) -> Void
@@ -550,21 +685,24 @@ private final class FileSender {
     var sent: Int64 = 0
     let throttle = ProgressThrottle()
 
-    init(conn: NWConnection, handle: FileHandle, size: Int64,
+    init(conn: NWConnection, channel: SecureChannel, handle: FileHandle, size: Int64,
          done: @escaping (Bool, String?) -> Void, progress: @escaping (Double) -> Void) {
-        self.conn = conn; self.handle = handle; self.size = size
+        self.conn = conn; self.channel = channel; self.handle = handle; self.size = size
         self.done = done; self.progress = progress
     }
 
     func pump() {
         if sent >= size { try? handle.close(); done(true, nil); return }
-        let want = Int(min(Int64(256 * 1024), size - sent))
+        let want = Int(min(Int64(Wire.chunkSize), size - sent))
         let chunk: Data
         do { chunk = try handle.read(upToCount: want) ?? Data() } catch {
             try? handle.close(); done(false, "读取文件失败"); return
         }
         if chunk.isEmpty { try? handle.close(); done(false, "文件在发送过程中被修改"); return }
-        conn.send(content: chunk, completion: .contentProcessed { [self] error in
+        guard let record = try? Wire.secureChunk(chunk, channel) else {
+            try? handle.close(); done(false, "加密失败"); return
+        }
+        conn.send(content: record, completion: .contentProcessed { [self] error in
             if let error { try? handle.close(); done(false, error.localizedDescription); return }
             sent += Int64(chunk.count)
             if throttle.shouldEmit(done: sent, total: size) {
